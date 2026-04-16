@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse, after } from 'next/server';
 import { getServiceSupabase } from '@/lib/supabase';
 import { searchBusinesses, parseAddress } from '@/lib/scraper/google-places';
 import { analyzePageSpeed } from '@/lib/scraper/pagespeed';
@@ -65,18 +65,24 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: jobError.message }, { status: 500 });
     }
 
-    // Run the scrape in the background (don't block the response)
-    runScrapeJob(
-      job.id,
-      niche,
-      city,
-      state,
-      googleApiKey,
-      pagespeedApiKey ?? '',
-      hunterApiKey ?? '',
-      supabase
-    ).catch((err) => {
-      console.error(`Scrape job ${job.id} failed:`, err);
+    // Schedule the scrape to run AFTER the response is sent.
+    // `after()` keeps the serverless function alive up to maxDuration,
+    // unlike fire-and-forget promises which get killed when the response ships.
+    after(async () => {
+      try {
+        await runScrapeJob(
+          job.id,
+          niche,
+          city,
+          state,
+          googleApiKey,
+          pagespeedApiKey ?? '',
+          hunterApiKey ?? '',
+          supabase
+        );
+      } catch (err) {
+        console.error(`Scrape job ${job.id} failed:`, err);
+      }
     });
 
     return NextResponse.json({
