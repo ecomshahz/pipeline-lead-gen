@@ -20,13 +20,14 @@ export async function analyzeWebsite(url: string): Promise<WebsiteAnalysis> {
 
   let html: string;
   try {
+    // 5s timeout, no retries — slow sites are common and we can't afford to wait
     html = await withRetry(async () => {
       const response = await fetch(normalizedUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         },
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(5000),
       });
 
       if (!response.ok) {
@@ -34,7 +35,7 @@ export async function analyzeWebsite(url: string): Promise<WebsiteAnalysis> {
       }
 
       return response.text();
-    }, 2);
+    }, 0);
   } catch {
     // Can't fetch the website — return defaults
     return {

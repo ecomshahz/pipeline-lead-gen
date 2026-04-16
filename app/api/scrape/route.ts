@@ -9,6 +9,18 @@ import { calculateLeadScore } from '@/lib/scoring';
 import { STATE_TIMEZONES } from '@/lib/niches';
 import { delay } from '@/lib/utils';
 
+// Vercel serverless limit: 60s on Hobby plan, up to 300s on Pro.
+// The scrape loop checks this and bails before the function is killed.
+export const maxDuration = 60;
+
+// Process at most this many places per job so we finish within maxDuration.
+// Each place takes ~1-3s (Google Places details + website analysis + DB insert).
+const MAX_PLACES_PER_JOB = 20;
+
+// How many seconds before function timeout we should stop starting new work.
+// Leaves a buffer so in-flight work (DB writes) can complete.
+const TIMEOUT_BUFFER_MS = 8000;
+
 // In-memory set of cancelled job IDs (checked during scrape loop)
 const cancelledJobs = new Set<string>();
 
@@ -154,10 +166,14 @@ async function runScrapeJob(
   supabase: ReturnType<typeof getServiceSupabase>
 ) {
   let leadsFound = 0;
+  const startedAt = Date.now();
+  const deadlineMs = startedAt + (maxDuration * 1000) - TIMEOUT_BUFFER_MS;
+  // PageSpeed is slow (3-30s per URL) and optional — enable with RUN_PAGESPEED=true
+  const runPageSpeed = process.env.RUN_PAGESPEED === 'true';
 
   try {
-    // Step 1: Search Google Places
-    const places = await searchBusinesses(niche, city, state, googleApiKey);
+    // Step 1: Search Google Places (capped so we fit within maxDuration)
+    const places = await searchBusinesses(niche, city, state, googleApiKey, MAX_PLACES_PER_JOB);
     console.log(`Found ${places.length} places for ${niche} in ${city}, ${state}`);
 
     for (const place of places) {
@@ -166,6 +182,13 @@ async function runScrapeJob(
         console.log(`Job ${jobId} cancelled by user`);
         cancelledJobs.delete(jobId);
         return;
+      }
+
+      // Bail if we're about to hit Vercel's serverless timeout.
+      // Mark the job completed with whatever we got so far.
+      if (Date.now() > deadlineMs) {
+        console.log(`Job ${jobId} stopping early near timeout (${leadsFound} leads found)`);
+        break;
       }
 
       try {
@@ -177,7 +200,8 @@ async function runScrapeJob(
 
         // Step 2: Analyze website if it exists
         if (hasWebsite && place.website) {
-          if (pagespeedApiKey) {
+          // PageSpeed is opt-in — it's the slowest step (3-30s per URL)
+          if (runPageSpeed && pagespeedApiKey) {
             try {
               const psResult = await analyzePageSpeed(place.website, pagespeedApiKey);
               websiteScore = psResult.score;
@@ -257,7 +281,7 @@ async function runScrapeJob(
           console.warn(`Failed to insert lead ${place.name}:`, insertError.message);
         }
 
-        await delay(200);
+        await delay(50);
       } catch (err) {
         console.error(`Error processing ${place.name}:`, err);
       }
