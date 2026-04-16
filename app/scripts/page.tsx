@@ -5,11 +5,13 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Phone, BookOpen, Mic, Plus, Trash2, Edit3, X, Check,
   ThumbsUp, ThumbsDown, ChevronDown, ChevronRight,
-  Loader2, BarChart3, MessageSquare,
+  Loader2, BarChart3, MessageSquare, Copy, Sparkles,
+  MessagesSquare, ShieldAlert, Send, Target,
 } from 'lucide-react';
 import { cn, formatDateTime } from '@/lib/utils';
 import { CallRecorder, TranscriptInput } from '@/components/calls/call-recorder';
 import { NICHES } from '@/lib/niches';
+import { NICHE_PLAYBOOKS, type NichePlaybook } from '@/lib/niche-playbooks';
 
 interface Script {
   id: string;
@@ -63,7 +65,8 @@ const SCENARIO_LABELS: Record<string, string> = {
 };
 
 export default function ScriptsPage() {
-  const [activeTab, setActiveTab] = useState<'scripts' | 'playbook' | 'recorder' | 'history'>('scripts');
+  const [activeTab, setActiveTab] = useState<'scripts' | 'niches' | 'playbook' | 'recorder' | 'history'>('scripts');
+  const [selectedNiche, setSelectedNiche] = useState<string>(NICHE_PLAYBOOKS[0]?.slug ?? '');
   const [scripts, setScripts] = useState<Script[]>([]);
   const [playbook, setPlaybook] = useState<{ works: PlaybookTip[]; avoid: PlaybookTip[] }>({ works: [], avoid: [] });
   const [recordings, setRecordings] = useState<Recording[]>([]);
@@ -211,6 +214,7 @@ export default function ScriptsPage() {
       <div className="flex gap-1 bg-card border border-border rounded-lg p-1 w-fit flex-wrap">
         {([
           { key: 'scripts', label: 'Scripts', icon: BookOpen },
+          { key: 'niches', label: 'Niche Playbooks', icon: Target },
           { key: 'playbook', label: 'Playbook', icon: MessageSquare },
           { key: 'recorder', label: 'Record & Analyze', icon: Mic },
           { key: 'history', label: 'Call History', icon: BarChart3 },
@@ -302,6 +306,15 @@ export default function ScriptsPage() {
             ))
           )}
         </div>
+      )}
+
+      {/* Niche Playbooks Tab */}
+      {activeTab === 'niches' && (
+        <NichePlaybooksView
+          playbooks={NICHE_PLAYBOOKS}
+          selectedSlug={selectedNiche}
+          onSelect={setSelectedNiche}
+        />
       )}
 
       {/* Playbook Tab */}
@@ -610,6 +623,278 @@ export default function ScriptsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+function NichePlaybooksView({
+  playbooks,
+  selectedSlug,
+  onSelect,
+}: {
+  playbooks: NichePlaybook[];
+  selectedSlug: string;
+  onSelect: (slug: string) => void;
+}) {
+  const playbook = playbooks.find((p) => p.slug === selectedSlug) ?? playbooks[0];
+
+  if (!playbook) {
+    return (
+      <div className="bg-card border border-border rounded-xl p-8 text-center text-muted text-sm">
+        <Target className="w-8 h-8 mx-auto mb-3 opacity-50" />
+        No niche playbooks yet. Add one in <span className="font-mono">lib/niche-playbooks.ts</span>.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Niche selector */}
+      <div className="flex flex-wrap gap-2">
+        {playbooks.map((p) => (
+          <button
+            key={p.slug}
+            onClick={() => onSelect(p.slug)}
+            className={cn(
+              'flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border transition-colors',
+              selectedSlug === p.slug
+                ? 'bg-accent-blue/10 text-accent-blue border-accent-blue/40'
+                : 'bg-card text-muted border-border hover:text-foreground'
+            )}
+          >
+            {p.emoji && <span className="text-base">{p.emoji}</span>}
+            {p.name}
+          </button>
+        ))}
+      </div>
+
+      {/* Header */}
+      <div className="bg-card border border-border rounded-xl p-6">
+        <div className="flex items-center gap-3 mb-2">
+          {playbook.emoji && <span className="text-3xl">{playbook.emoji}</span>}
+          <h2 className="text-xl font-bold tracking-tight">{playbook.name}</h2>
+        </div>
+        {playbook.tagline && (
+          <p className="text-sm text-muted">{playbook.tagline}</p>
+        )}
+      </div>
+
+      {/* Cold DMs / Text Messages */}
+      {playbook.dms && playbook.dms.length > 0 && (
+        <PlaybookSection
+          title="Cold Text / DM Messages (First Touch)"
+          subtitle="These are your openers. The goal isn't to close — it's to start a conversation."
+          icon={MessagesSquare}
+          accent="text-accent-blue"
+        >
+          <div className="space-y-3">
+            {playbook.dms.map((dm, i) => (
+              <CopyableCard
+                key={i}
+                label={`Message ${i + 1} — ${dm.label}`}
+                description={dm.description}
+                body={dm.body}
+              />
+            ))}
+          </div>
+        </PlaybookSection>
+      )}
+
+      {/* Cold Call Script */}
+      {playbook.coldCall && playbook.coldCall.length > 0 && (
+        <PlaybookSection
+          title="Cold Call Script"
+          subtitle="Niche-specific script — pattern interrupt, listen, soft close."
+          icon={Phone}
+          accent="text-accent-green"
+        >
+          <div className="space-y-3">
+            {playbook.coldCall.map((block, i) => (
+              <CopyableCard
+                key={i}
+                label={block.label}
+                description={block.guidance}
+                body={block.body}
+              />
+            ))}
+          </div>
+        </PlaybookSection>
+      )}
+
+      {/* Objection Responses */}
+      {playbook.objections && playbook.objections.length > 0 && (
+        <PlaybookSection
+          title="Objection Responses"
+          subtitle="Pre-written responses to the most common pushback."
+          icon={ShieldAlert}
+          accent="text-accent-amber"
+        >
+          <div className="space-y-3">
+            {playbook.objections.map((obj, i) => (
+              <div
+                key={i}
+                className="bg-background border border-border/50 rounded-lg overflow-hidden"
+              >
+                <div className="px-4 py-3 bg-accent-amber/5 border-b border-accent-amber/20">
+                  <p className="text-xs font-medium text-accent-amber uppercase tracking-wider mb-1">
+                    Objection
+                  </p>
+                  <p className="text-sm italic">&ldquo;{obj.objection}&rdquo;</p>
+                </div>
+                <div className="p-4">
+                  {obj.guidance && (
+                    <p className="text-xs text-accent-red mb-2 flex items-center gap-1.5">
+                      <ShieldAlert className="w-3 h-3" />
+                      {obj.guidance}
+                    </p>
+                  )}
+                  <p className="text-sm text-muted whitespace-pre-wrap leading-relaxed">
+                    {obj.response}
+                  </p>
+                  <CopyButton text={obj.response} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </PlaybookSection>
+      )}
+
+      {/* Follow-Up Sequence */}
+      {playbook.followUps && playbook.followUps.length > 0 && (
+        <PlaybookSection
+          title="Follow-Up Sequence"
+          subtitle="After sending a spec site — a simple cadence that stays polite but persistent."
+          icon={Send}
+          accent="text-accent-blue"
+        >
+          <div className="relative border-l-2 border-border ml-2 pl-6 space-y-4">
+            {playbook.followUps.map((fu, i) => (
+              <div key={i} className="relative">
+                <div className="absolute -left-[30px] top-1 w-3 h-3 rounded-full bg-accent-blue border-2 border-background" />
+                <p className="text-xs font-medium text-accent-blue uppercase tracking-wider mb-2">
+                  {fu.timing}
+                </p>
+                <CopyableCard body={fu.body} />
+              </div>
+            ))}
+          </div>
+        </PlaybookSection>
+      )}
+
+      {/* Key Selling Points */}
+      {playbook.sellingPoints && playbook.sellingPoints.length > 0 && (
+        <PlaybookSection
+          title="Key Selling Points"
+          subtitle="Weave these in naturally during conversation — don't dump them all at once."
+          icon={Sparkles}
+          accent="text-accent-green"
+        >
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {playbook.sellingPoints.map((sp, i) => (
+              <div
+                key={i}
+                className="p-4 bg-background border border-border/50 rounded-lg"
+              >
+                <h4 className="text-sm font-semibold text-accent-green mb-1.5 flex items-center gap-2">
+                  <Sparkles className="w-3.5 h-3.5" />
+                  {sp.headline}
+                </h4>
+                <p className="text-xs text-muted leading-relaxed">{sp.detail}</p>
+              </div>
+            ))}
+          </div>
+        </PlaybookSection>
+      )}
+    </div>
+  );
+}
+
+function PlaybookSection({
+  title,
+  subtitle,
+  icon: Icon,
+  accent,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  icon: React.ComponentType<{ className?: string }>;
+  accent: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="bg-card border border-border rounded-xl overflow-hidden">
+      <div className="px-5 py-4 border-b border-border flex items-start gap-3">
+        <Icon className={cn('w-5 h-5 shrink-0 mt-0.5', accent)} />
+        <div>
+          <h3 className="font-semibold text-sm">{title}</h3>
+          {subtitle && <p className="text-xs text-muted mt-0.5">{subtitle}</p>}
+        </div>
+      </div>
+      <div className="p-5">{children}</div>
+    </div>
+  );
+}
+
+function CopyableCard({
+  label,
+  description,
+  body,
+}: {
+  label?: string;
+  description?: string;
+  body: string;
+}) {
+  return (
+    <div className="bg-background border border-border/50 rounded-lg p-4">
+      {label && (
+        <p className="text-xs font-medium text-accent-blue uppercase tracking-wider mb-1">
+          {label}
+        </p>
+      )}
+      {description && (
+        <p className="text-xs text-muted italic mb-2">{description}</p>
+      )}
+      <p className="text-sm text-muted whitespace-pre-wrap leading-relaxed">{body}</p>
+      <CopyButton text={body} />
+    </div>
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // no-op
+    }
+  };
+
+  return (
+    <button
+      onClick={copy}
+      className={cn(
+        'mt-3 inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded-md border transition-colors',
+        copied
+          ? 'bg-accent-green/10 text-accent-green border-accent-green/30'
+          : 'bg-transparent text-muted border-border hover:text-foreground hover:border-accent-blue/40'
+      )}
+    >
+      {copied ? (
+        <>
+          <Check className="w-3 h-3" />
+          Copied
+        </>
+      ) : (
+        <>
+          <Copy className="w-3 h-3" />
+          Copy
+        </>
+      )}
+    </button>
   );
 }
 
