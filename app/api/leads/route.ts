@@ -145,20 +145,48 @@ export async function PATCH(request: NextRequest) {
   }
 }
 
-// DELETE /api/leads — Delete a lead
+// DELETE /api/leads — Delete one lead (?id=) or many (JSON body { ids: [] })
 export async function DELETE(request: NextRequest) {
   const supabase = getServiceSupabase();
   const id = request.nextUrl.searchParams.get('id');
 
-  if (!id) {
-    return NextResponse.json({ error: 'Lead ID required' }, { status: 400 });
+  // Single-lead delete via query string (existing behavior)
+  if (id) {
+    const { error } = await supabase.from('leads').delete().eq('id', id);
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+    return NextResponse.json({ success: true, deleted: 1 });
   }
 
-  const { error } = await supabase.from('leads').delete().eq('id', id);
+  // Bulk delete via JSON body { ids: string[] }
+  try {
+    const body = await request.json();
+    const ids = Array.isArray(body?.ids) ? (body.ids as string[]) : null;
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    if (!ids || ids.length === 0) {
+      return NextResponse.json(
+        { error: 'Lead ID(s) required — pass ?id= or { ids: [] }' },
+        { status: 400 }
+      );
+    }
+
+    // Cap to protect against accidental mass-delete
+    if (ids.length > 500) {
+      return NextResponse.json(
+        { error: 'Cannot delete more than 500 leads at once' },
+        { status: 400 }
+      );
+    }
+
+    const { error } = await supabase.from('leads').delete().in('id', ids);
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
+    return NextResponse.json({ success: true, deleted: ids.length });
+  } catch {
+    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
-
-  return NextResponse.json({ success: true });
 }

@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { useLeads } from '@/hooks/use-leads';
 import { Lead, LeadStatus } from '@/types';
 import { getScoreBadgeColor, getScoreLabel } from '@/lib/scoring';
@@ -40,6 +41,7 @@ import {
   Eye,
   Send,
   Save,
+  Briefcase,
 } from 'lucide-react';
 
 // ---- Constants ----
@@ -128,6 +130,25 @@ export default function LeadsPage() {
 
   // Bulk actions
   const [bulkStatusOpen, setBulkStatusOpen] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [composeSubject, setComposeSubject] = useState(
+    'Quick question about {{business_name}}'
+  );
+  const [composeBody, setComposeBody] = useState(
+    "Hi {{owner_name}},\n\nI work with {{niche}} businesses in {{city}} and noticed {{business_name}} doesn't have a strong online presence yet.\n\nI help shops like yours attract more customers with a modern website and AI tools — would a quick 10-minute chat this week be useful?\n\n{{sender_name}}\n{{sender_title}}"
+  );
+  const [sending, setSending] = useState(false);
+  const [composeFeedback, setComposeFeedback] = useState<string | null>(null);
+  // Scope of the compose modal — null = bulk (use selection), otherwise single lead
+  const [composeTarget, setComposeTarget] = useState<Lead | null>(null);
+  // Enrichment state
+  const [enriching, setEnriching] = useState(false);
+  const [enrichMessage, setEnrichMessage] = useState<string | null>(null);
+  // Convert-to-client state
+  const [convertingClient, setConvertingClient] = useState(false);
+  const router = useRouter();
 
   // Debounce search
   const searchTimer = useRef<NodeJS.Timeout | null>(null);
@@ -272,6 +293,168 @@ export default function LeadsPage() {
     [selectedIds, updateLead, refresh]
   );
 
+  // Bulk delete
+  const handleBulkDelete = useCallback(async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setDeleting(true);
+    try {
+      const res = await fetch('/api/leads', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? 'Delete failed');
+      }
+      setSelectedIds(new Set());
+      setConfirmDeleteOpen(false);
+      refresh();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to delete leads');
+    } finally {
+      setDeleting(false);
+    }
+  }, [selectedIds, refresh]);
+
+  // Bulk email compose — sends via Resend through /api/emails/send
+  const selectedWithEmail = useMemo(
+    () => leads.filter((l) => selectedIds.has(l.id) && !!l.email),
+    [leads, selectedIds]
+  );
+
+  // Whoever the compose modal is targeting right now: the single lead if set,
+  // otherwise the bulk selection filtered to those with emails.
+  const composeRecipients = useMemo<Lead[]>(
+    () => (composeTarget ? (composeTarget.email ? [composeTarget] : []) : selectedWithEmail),
+    [composeTarget, selectedWithEmail]
+  );
+
+  const handleSendCampaign = useCallback(async () => {
+    const ids = composeRecipients.map((l) => l.id);
+    if (ids.length === 0) {
+      setComposeFeedback('No recipients have an email address.');
+      return;
+    }
+    if (!composeSubject.trim() || !composeBody.trim()) {
+      setComposeFeedback('Subject and body are required.');
+      return;
+    }
+    setSending(true);
+    setComposeFeedback(null);
+    try {
+      const res = await fetch('/api/emails/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          leadIds: ids,
+          customSubject: composeSubject,
+          customBody: composeBody,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.error ?? 'Send failed');
+      }
+      setComposeFeedback(
+        `${data.message ?? `Queued ${data.queued ?? ids.length} emails`}. You can close this window.`
+      );
+      // Refresh after a beat so sent statuses show up
+      setTimeout(() => refresh(), 4000);
+    } catch (err) {
+      setComposeFeedback(err instanceof Error ? err.message : 'Failed to send');
+    } finally {
+      setSending(false);
+    }
+  }, [composeRecipients, composeSubject, composeBody, refresh]);
+
+  // Defaults for the "build them a website" pitch. Different starter for
+  // no-website leads vs. sites-that-need-improvement leads.
+  const composeForLead = useCallback((lead: Lead) => {
+    const hasSite = !!(lead.has_website && lead.website_url);
+    setComposeTarget(lead);
+    setComposeFeedback(null);
+    setComposeSubject(
+      hasSite
+        ? 'A few ideas for {{business_name}}\'s website'
+        : 'A website for {{business_name}}'
+    );
+    setComposeBody(
+      hasSite
+        ? "Hi {{owner_name}},\n\nI came across {{business_name}} while looking at {{niche}} in {{city}} and took a quick look at your current site.\n\n{{website_issue}}\n\nI build fast, mobile-friendly websites plus AI tools (booking, chat, lead capture) that help local shops turn more visits into paying customers. Would a short 10-minute call this week to walk you through a quick before/after mock-up be useful?\n\nNo pressure either way — happy to help.\n\n{{sender_name}}\n{{sender_title}}"
+        : "Hi {{owner_name}},\n\nI noticed {{business_name}} is doing great on Google (your reviews are solid!), but you don't seem to have a website yet. For a {{niche}} in {{city}}, a website is usually the #1 thing driving new-customer calls after hours.\n\nI build modern sites for local businesses — mobile-friendly, fast to load, with online booking and a contact form built in. Most of our {{niche}} clients see more inbound leads within the first 30 days.\n\nWould you be open to a quick 10-minute chat this week to see what it'd look like for {{business_name}}?\n\n{{sender_name}}\n{{sender_title}}"
+    );
+    setComposeOpen(true);
+  }, []);
+
+  // Convert a closed_won lead into a tracked client. Creates the client in
+  // the Clients section (defaulting to monthly / $0 so the user can fill in
+  // real numbers on the clients page) and jumps there.
+  const convertToClient = useCallback(
+    async (lead: Lead) => {
+      if (convertingClient) return;
+      const confirmMsg = `Convert ${lead.business_name} into a client? You can set billing amount and service details on the next screen.`;
+      if (!confirm(confirmMsg)) return;
+
+      setConvertingClient(true);
+      try {
+        const res = await fetch('/api/clients', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            lead_id: lead.id,
+            business_name: lead.business_name,
+            owner_name: lead.owner_name,
+            email: lead.email,
+            phone: lead.phone,
+            website_url: lead.website_url,
+            city: lead.city,
+            state: lead.state,
+            niche: lead.niche,
+            service_type: 'AI Website',
+            billing_type: 'monthly',
+            amount: 0,
+            status: 'active',
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? 'Failed to convert lead');
+        router.push('/clients');
+      } catch (err) {
+        alert(err instanceof Error ? err.message : 'Failed to convert lead to client');
+      } finally {
+        setConvertingClient(false);
+      }
+    },
+    [convertingClient, router]
+  );
+
+  // Enrich emails — background scrapes the websites of leads missing an email
+  const handleEnrichEmails = useCallback(async () => {
+    setEnriching(true);
+    setEnrichMessage(null);
+    try {
+      const res = await fetch('/api/leads/enrich-emails', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? 'Enrichment failed');
+      setEnrichMessage(data.message ?? 'Enrichment queued.');
+      // Poll refresh a few times so newly filled emails appear
+      setTimeout(() => refresh(), 15000);
+      setTimeout(() => refresh(), 30000);
+      setTimeout(() => setEnrichMessage(null), 12000);
+    } catch (err) {
+      setEnrichMessage(err instanceof Error ? err.message : 'Failed');
+      setTimeout(() => setEnrichMessage(null), 6000);
+    } finally {
+      setEnriching(false);
+    }
+  }, [refresh]);
+
   // Bulk export
   const handleExportSelected = useCallback(() => {
     const selected = leads.filter((l) => selectedIds.has(l.id));
@@ -318,14 +501,34 @@ export default function LeadsPage() {
               {loading ? 'Loading...' : `${formatNumber(total)} total leads`}
             </p>
           </div>
-          <button
-            onClick={refresh}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg border border-[#1E1E2A] bg-[#111118] text-sm text-[#71717A] hover:text-white hover:border-[#3B82F6]/50 transition-colors"
-          >
-            <RotateCcw className={cn('w-4 h-4', loading && 'animate-spin')} />
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleEnrichEmails}
+              disabled={enriching}
+              title="Scrape websites of leads missing emails and fill them in"
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-[#1E1E2A] bg-[#111118] text-sm text-[#71717A] hover:text-white hover:border-[#10B981]/50 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {enriching ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Mail className="w-4 h-4" />
+              )}
+              Enrich Emails
+            </button>
+            <button
+              onClick={refresh}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-[#1E1E2A] bg-[#111118] text-sm text-[#71717A] hover:text-white hover:border-[#3B82F6]/50 transition-colors"
+            >
+              <RotateCcw className={cn('w-4 h-4', loading && 'animate-spin')} />
+              Refresh
+            </button>
+          </div>
         </div>
+        {enrichMessage && (
+          <div className="mb-4 text-sm rounded-lg px-3 py-2 bg-[#10B981]/10 border border-[#10B981]/30 text-[#10B981]">
+            {enrichMessage}
+          </div>
+        )}
 
         {/* Filter Bar */}
         <div className="bg-[#111118] border border-[#1E1E2A] rounded-xl p-4 mb-6">
@@ -471,15 +674,19 @@ export default function LeadsPage() {
 
               <button
                 onClick={() => {
-                  const selected = leads.filter((l) => selectedIds.has(l.id) && l.email);
-                  if (selected.length > 0) {
-                    window.location.href = `mailto:${selected.map((l) => l.email).join(',')}`;
-                  }
+                  setComposeTarget(null);
+                  setComposeFeedback(null);
+                  setComposeOpen(true);
                 }}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-[#111118] border border-[#1E1E2A] text-white hover:border-[#3B82F6]/50 transition-colors"
+                title={
+                  selectedWithEmail.length === 0
+                    ? 'No selected leads have emails'
+                    : `Compose email to ${selectedWithEmail.length} lead${selectedWithEmail.length === 1 ? '' : 's'}`
+                }
               >
                 <Send className="w-3 h-3" />
-                Send Email
+                Send Email{selectedWithEmail.length > 0 ? ` (${selectedWithEmail.length})` : ''}
               </button>
 
               {/* Bulk status dropdown */}
@@ -512,6 +719,14 @@ export default function LeadsPage() {
               >
                 <Download className="w-3 h-3" />
                 Export Selected
+              </button>
+
+              <button
+                onClick={() => setConfirmDeleteOpen(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-[#EF4444]/10 border border-[#EF4444]/30 text-[#EF4444] hover:bg-[#EF4444]/20 transition-colors"
+              >
+                <Trash2 className="w-3 h-3" />
+                Delete Selected
               </button>
 
               <button
@@ -730,12 +945,27 @@ export default function LeadsPage() {
 
                       {/* Actions */}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          onClick={() => openDetail(lead)}
-                          className="text-[#71717A] hover:text-white transition-colors"
-                        >
-                          <Eye className="w-4 h-4" />
-                        </button>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => composeForLead(lead)}
+                            disabled={!lead.email}
+                            title={
+                              lead.email
+                                ? `Send cold email to ${lead.email}`
+                                : 'No email on file — run Enrich Emails'
+                            }
+                            className="p-1 rounded text-[#71717A] hover:text-[#3B82F6] hover:bg-[#3B82F6]/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-[#71717A]"
+                          >
+                            <Send className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => openDetail(lead)}
+                            title="View details"
+                            className="p-1 rounded text-[#71717A] hover:text-white hover:bg-[#1E1E2A] transition-colors"
+                          >
+                            <Eye className="w-4 h-4" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))
@@ -874,6 +1104,22 @@ export default function LeadsPage() {
                     ))}
                   </select>
                 </div>
+
+                {/* Convert to client — only relevant once the deal is closed */}
+                {detailStatus === 'closed_won' && (
+                  <button
+                    onClick={() => convertToClient(detailLead)}
+                    disabled={convertingClient}
+                    className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-sm font-medium bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+                  >
+                    {convertingClient ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Briefcase className="w-4 h-4" />
+                    )}
+                    Convert to Client
+                  </button>
+                )}
 
                 {/* Contact Info */}
                 <div>
@@ -1130,6 +1376,181 @@ export default function LeadsPage() {
                   <p>Created: {formatDate(detailLead.created_at)}</p>
                   <p>Updated: {timeAgo(detailLead.updated_at)}</p>
                   <p className="font-[family-name:var(--font-geist-mono)]">ID: {detailLead.id}</p>
+                </div>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Confirm Bulk Delete Modal */}
+      <AnimatePresence>
+        {confirmDeleteOpen && (
+          <>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/70 z-50"
+              onClick={() => !deleting && setConfirmDeleteOpen(false)}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-md bg-[#111118] border border-[#1E1E2A] rounded-xl shadow-2xl z-50 p-6"
+            >
+              <div className="flex items-start gap-3 mb-4">
+                <div className="w-10 h-10 rounded-full bg-[#EF4444]/10 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5 text-[#EF4444]" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-white">Delete {selectedIds.size} lead{selectedIds.size === 1 ? '' : 's'}?</h3>
+                  <p className="text-sm text-[#71717A] mt-1">
+                    This permanently removes the selected leads and their email history. This cannot be undone.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2 justify-end">
+                <button
+                  onClick={() => setConfirmDeleteOpen(false)}
+                  disabled={deleting}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-[#71717A] hover:text-white transition-colors disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleBulkDelete}
+                  disabled={deleting}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-[#EF4444] text-white hover:bg-[#DC2626] transition-colors disabled:opacity-50"
+                >
+                  {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                  Delete {selectedIds.size}
+                </button>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Compose Email Modal */}
+      <AnimatePresence>
+        {composeOpen && (
+          <>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 bg-black/70 z-50"
+              onClick={() => {
+                if (sending) return;
+                setComposeOpen(false);
+                setComposeTarget(null);
+              }}
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.97 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.97 }}
+              className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full max-w-2xl max-h-[90vh] overflow-y-auto bg-[#111118] border border-[#1E1E2A] rounded-xl shadow-2xl z-50 p-6"
+            >
+              <div className="flex items-start justify-between mb-4">
+                <div>
+                  <h3 className="font-semibold text-white flex items-center gap-2">
+                    <Mail className="w-4 h-4 text-[#3B82F6]" />
+                    {composeTarget ? 'Send Cold Email' : 'Cold Email Blast'}
+                  </h3>
+                  <p className="text-sm text-[#71717A] mt-1">
+                    {composeTarget ? (
+                      <>
+                        Sending to <span className="text-white font-medium">{composeTarget.business_name}</span>
+                        {composeTarget.email && (
+                          <span className="text-[#71717A]"> ({composeTarget.email})</span>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        Sending to <span className="text-white font-medium">{selectedWithEmail.length}</span> of {selectedIds.size} selected
+                        {selectedIds.size !== selectedWithEmail.length && (
+                          <span className="text-[#71717A]"> — {selectedIds.size - selectedWithEmail.length} skipped (no email)</span>
+                        )}
+                      </>
+                    )}
+                  </p>
+                </div>
+                <button
+                  onClick={() => { setComposeOpen(false); setComposeTarget(null); }}
+                  disabled={sending}
+                  className="text-[#71717A] hover:text-white transition-colors disabled:opacity-50"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="text-xs font-medium text-[#71717A] uppercase tracking-wider mb-1.5 block">Subject</label>
+                  <input
+                    type="text"
+                    value={composeSubject}
+                    onChange={(e) => setComposeSubject(e.target.value)}
+                    className="w-full bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-[#3B82F6]/50"
+                    disabled={sending}
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium text-[#71717A] uppercase tracking-wider mb-1.5 block">Body</label>
+                  <textarea
+                    value={composeBody}
+                    onChange={(e) => setComposeBody(e.target.value)}
+                    rows={12}
+                    className="w-full bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg px-3 py-2 text-sm text-white font-[family-name:var(--font-geist-mono)] focus:outline-none focus:border-[#3B82F6]/50 resize-none"
+                    disabled={sending}
+                  />
+                </div>
+
+                <div className="bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg p-3">
+                  <p className="text-xs font-medium text-[#71717A] uppercase tracking-wider mb-2">Available placeholders</p>
+                  <div className="flex flex-wrap gap-1.5 text-[11px] font-[family-name:var(--font-geist-mono)]">
+                    {['{{business_name}}','{{owner_name}}','{{niche}}','{{city}}','{{website_issue}}','{{ai_opportunity}}','{{sender_name}}','{{sender_title}}'].map((p) => (
+                      <span key={p} className="px-2 py-0.5 rounded bg-[#111118] border border-[#1E1E2A] text-[#3B82F6]">{p}</span>
+                    ))}
+                  </div>
+                </div>
+
+                {composeFeedback && (
+                  <div className={cn(
+                    'text-sm rounded-lg px-3 py-2 border',
+                    composeFeedback.startsWith('Queued') || composeFeedback.toLowerCase().includes('queued')
+                      ? 'bg-[#10B981]/10 border-[#10B981]/30 text-[#10B981]'
+                      : 'bg-[#EF4444]/10 border-[#EF4444]/30 text-[#EF4444]'
+                  )}>
+                    {composeFeedback}
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between pt-2 border-t border-[#1E1E2A]">
+                  <p className="text-[11px] text-[#71717A]">
+                    Sends via Resend. Configure from-address in Settings.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => { setComposeOpen(false); setComposeTarget(null); }}
+                      disabled={sending}
+                      className="px-4 py-2 rounded-lg text-sm font-medium text-[#71717A] hover:text-white transition-colors disabled:opacity-50"
+                    >
+                      {composeFeedback?.toLowerCase().includes('queued') ? 'Close' : 'Cancel'}
+                    </button>
+                    <button
+                      onClick={handleSendCampaign}
+                      disabled={sending || composeRecipients.length === 0}
+                      className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-[#3B82F6] text-white hover:bg-[#2563EB] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                      {composeTarget ? 'Send' : `Send to ${composeRecipients.length}`}
+                    </button>
+                  </div>
                 </div>
               </div>
             </motion.div>

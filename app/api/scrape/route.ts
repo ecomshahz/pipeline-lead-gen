@@ -1,21 +1,28 @@
 import { NextRequest, NextResponse, after } from 'next/server';
 import { getServiceSupabase } from '@/lib/supabase';
-import { searchBusinesses, parseAddress } from '@/lib/scraper/google-places';
+import {
+  searchBusinesses,
+  parseAddress,
+  type PlaceResult,
+} from '@/lib/scraper/google-places';
 import { analyzePageSpeed } from '@/lib/scraper/pagespeed';
 import { findEmailByDomain } from '@/lib/scraper/email-finder';
 import { analyzeWebsite } from '@/lib/scraper/website-analyzer';
 import { detectAIOpportunities } from '@/lib/scraper/ai-detector';
 import { calculateLeadScore } from '@/lib/scoring';
 import { STATE_TIMEZONES } from '@/lib/niches';
-import { delay } from '@/lib/utils';
 
 // Vercel serverless limit: 60s on Hobby plan, up to 300s on Pro.
 // The scrape loop checks this and bails before the function is killed.
 export const maxDuration = 60;
 
-// Process at most this many places per job so we finish within maxDuration.
-// Each place takes ~1-3s (Google Places details + website analysis + DB insert).
-const MAX_PLACES_PER_JOB = 20;
+// Process at most this many places per job. 60 is Google Places' hard ceiling
+// (3 pages × 20). Heavy lifting is parallelized, so this fits inside maxDuration.
+const MAX_PLACES_PER_JOB = 60;
+
+// How many places we analyze concurrently. Each branch does a website fetch
+// (≤5s) plus a few DB ops. 10 keeps Vercel + Supabase happy.
+const PLACE_BATCH_SIZE = 10;
 
 // How many seconds before function timeout we should stop starting new work.
 // Leaves a buffer so in-flight work (DB writes) can complete.
@@ -182,7 +189,22 @@ async function runScrapeJob(
     const places = await searchBusinesses(niche, city, state, googleApiKey, MAX_PLACES_PER_JOB);
     console.log(`Found ${places.length} places for ${niche} in ${city}, ${state}`);
 
-    for (const place of places) {
+    // Hot-lead prioritization: process businesses with NO website first.
+    // They're the highest-value prospects for an AI/web agency, AND they skip
+    // the slow website-analysis path so we get to "leads found > 0" fast.
+    const sortedPlaces = [...places].sort((a, b) => {
+      const aHot = a.website ? 1 : 0;
+      const bHot = b.website ? 1 : 0;
+      if (aHot !== bHot) return aHot - bHot;
+      // Within each bucket, prefer well-reviewed businesses (better close potential)
+      const aReviews = a.user_ratings_total ?? 0;
+      const bReviews = b.user_ratings_total ?? 0;
+      return bReviews - aReviews;
+    });
+
+    // Process places in parallel batches. Each batch does Google + website +
+    // optional Hunter + DB insert concurrently — bounded so we don't melt anything.
+    for (let i = 0; i < sortedPlaces.length; i += PLACE_BATCH_SIZE) {
       // Check if job was cancelled
       if (cancelledJobs.has(jobId)) {
         console.log(`Job ${jobId} cancelled by user`);
@@ -191,105 +213,40 @@ async function runScrapeJob(
       }
 
       // Bail if we're about to hit Vercel's serverless timeout.
-      // Mark the job completed with whatever we got so far.
       if (Date.now() > deadlineMs) {
         console.log(`Job ${jobId} stopping early near timeout (${leadsFound} leads found)`);
         break;
       }
 
-      try {
-        const parsed = parseAddress(place.formatted_address);
-        const hasWebsite = !!place.website;
-        let websiteScore: number | null = null;
-        let websiteIssues: string[] = [];
-        let websiteAnalysis = null;
+      const batch = sortedPlaces.slice(i, i + PLACE_BATCH_SIZE);
+      const batchInserts = await Promise.allSettled(
+        batch.map((place) =>
+          processPlace(
+            place,
+            niche,
+            city,
+            state,
+            pagespeedApiKey,
+            hunterApiKey,
+            runPageSpeed,
+            supabase
+          )
+        )
+      );
 
-        // Step 2: Analyze website if it exists
-        if (hasWebsite && place.website) {
-          // PageSpeed is opt-in — it's the slowest step (3-30s per URL)
-          if (runPageSpeed && pagespeedApiKey) {
-            try {
-              const psResult = await analyzePageSpeed(place.website, pagespeedApiKey);
-              websiteScore = psResult.score;
-              websiteIssues = psResult.issues;
-            } catch (err) {
-              console.warn(`PageSpeed failed for ${place.website}:`, err);
-            }
-          }
-
-          try {
-            websiteAnalysis = await analyzeWebsite(place.website);
-            websiteIssues = [...new Set([...websiteIssues, ...websiteAnalysis.issues])];
-          } catch (err) {
-            console.warn(`Website analysis failed for ${place.website}:`, err);
-          }
+      let batchFound = 0;
+      for (const result of batchInserts) {
+        if (result.status === 'fulfilled' && result.value === 'inserted') {
+          batchFound++;
         }
+      }
 
-        // Step 3: Detect AI opportunities
-        const aiResult = detectAIOpportunities(websiteAnalysis, hasWebsite);
-
-        // Step 4: Find email
-        let email: string | null = null;
-        let ownerName: string | null = null;
-
-        if (hunterApiKey && hasWebsite && place.website) {
-          try {
-            const emailResult = await findEmailByDomain(place.website, hunterApiKey);
-            email = emailResult.email;
-            ownerName = emailResult.owner_name;
-          } catch (err) {
-            console.warn(`Email finder failed for ${place.website}:`, err);
-          }
-        }
-
-        // Step 5: Build lead data and calculate score
-        const leadData = {
-          business_name: place.name,
-          business_type: niche,
-          niche,
-          owner_name: ownerName,
-          phone: place.formatted_phone_number ?? null,
-          email,
-          address: parsed.address,
-          city: parsed.city || city,
-          state: parsed.state || state,
-          zip: parsed.zip,
-          timezone: STATE_TIMEZONES[parsed.state || state] ?? null,
-          website_url: place.website ?? null,
-          has_website: hasWebsite,
-          website_score: websiteScore,
-          website_issues: websiteIssues,
-          google_rating: place.rating ?? null,
-          review_count: place.user_ratings_total ?? 0,
-          needs_ai_services: aiResult.needs_ai_services,
-          ai_opportunity_notes: aiResult.ai_opportunity_notes,
-          source: 'google_places',
-          scraped_at: new Date().toISOString(),
-        };
-
-        const { score, breakdown } = calculateLeadScore(leadData);
-
-        // Step 6: Insert lead (with dedup check)
-        const { error: insertError } = await supabase.from('leads').insert({
-          ...leadData,
-          lead_score: score,
-          lead_score_breakdown: breakdown,
-        });
-
-        if (!insertError) {
-          leadsFound++;
-          // Update leads_found count in real-time
-          await supabase
-            .from('scrape_jobs')
-            .update({ leads_found: leadsFound })
-            .eq('id', jobId);
-        } else if (!insertError.message.includes('duplicate')) {
-          console.warn(`Failed to insert lead ${place.name}:`, insertError.message);
-        }
-
-        await delay(50);
-      } catch (err) {
-        console.error(`Error processing ${place.name}:`, err);
+      if (batchFound > 0) {
+        leadsFound += batchFound;
+        await supabase
+          .from('scrape_jobs')
+          .update({ leads_found: leadsFound })
+          .eq('id', jobId);
       }
     }
 
@@ -336,5 +293,109 @@ async function runScrapeJob(
       .eq('id', jobId);
   } finally {
     cancelledJobs.delete(jobId);
+  }
+}
+
+// Per-place pipeline: website analysis → AI detection → email lookup → DB insert.
+// Returns 'inserted' on success, 'duplicate' on dedup, 'error' on failure.
+// Designed to be safely run in parallel (Promise.allSettled) for many places at once.
+async function processPlace(
+  place: PlaceResult,
+  niche: string,
+  city: string,
+  state: string,
+  pagespeedApiKey: string,
+  hunterApiKey: string,
+  runPageSpeed: boolean,
+  supabase: ReturnType<typeof getServiceSupabase>
+): Promise<'inserted' | 'duplicate' | 'error'> {
+  try {
+    const parsed = parseAddress(place.formatted_address);
+    const hasWebsite = !!place.website;
+    let websiteScore: number | null = null;
+    let websiteIssues: string[] = [];
+    let websiteAnalysis = null;
+
+    // Website analysis (skipped entirely for no-website hot leads)
+    if (hasWebsite && place.website) {
+      // PageSpeed and DOM analysis run in parallel — both are HTTP-bound
+      const [psResult, htmlResult] = await Promise.allSettled([
+        runPageSpeed && pagespeedApiKey
+          ? analyzePageSpeed(place.website, pagespeedApiKey)
+          : Promise.resolve(null),
+        analyzeWebsite(place.website),
+      ]);
+
+      if (psResult.status === 'fulfilled' && psResult.value) {
+        websiteScore = psResult.value.score;
+        websiteIssues = psResult.value.issues;
+      } else if (psResult.status === 'rejected') {
+        console.warn(`PageSpeed failed for ${place.website}:`, psResult.reason);
+      }
+
+      if (htmlResult.status === 'fulfilled') {
+        websiteAnalysis = htmlResult.value;
+        websiteIssues = [...new Set([...websiteIssues, ...htmlResult.value.issues])];
+      } else {
+        console.warn(`Website analysis failed for ${place.website}:`, htmlResult.reason);
+      }
+    }
+
+    const aiResult = detectAIOpportunities(websiteAnalysis, hasWebsite);
+
+    // Prefer email scraped directly from the site (free, accurate). Fall back
+    // to Hunter.io if a key is configured and the website didn't surface one.
+    let email: string | null = websiteAnalysis?.email ?? null;
+    let ownerName: string | null = null;
+    if (!email && hunterApiKey && hasWebsite && place.website) {
+      try {
+        const emailResult = await findEmailByDomain(place.website, hunterApiKey);
+        email = emailResult.email;
+        ownerName = emailResult.owner_name;
+      } catch (err) {
+        console.warn(`Email finder failed for ${place.website}:`, err);
+      }
+    }
+
+    const leadData = {
+      business_name: place.name,
+      business_type: niche,
+      niche,
+      owner_name: ownerName,
+      phone: place.formatted_phone_number ?? null,
+      email,
+      address: parsed.address,
+      city: parsed.city || city,
+      state: parsed.state || state,
+      zip: parsed.zip,
+      timezone: STATE_TIMEZONES[parsed.state || state] ?? null,
+      website_url: place.website ?? null,
+      has_website: hasWebsite,
+      website_score: websiteScore,
+      website_issues: websiteIssues,
+      google_rating: place.rating ?? null,
+      review_count: place.user_ratings_total ?? 0,
+      needs_ai_services: aiResult.needs_ai_services,
+      ai_opportunity_notes: aiResult.ai_opportunity_notes,
+      source: 'google_places',
+      scraped_at: new Date().toISOString(),
+    };
+
+    const { score, breakdown } = calculateLeadScore(leadData);
+
+    const { error: insertError } = await supabase.from('leads').insert({
+      ...leadData,
+      lead_score: score,
+      lead_score_breakdown: breakdown,
+    });
+
+    if (!insertError) return 'inserted';
+    if (insertError.message.includes('duplicate')) return 'duplicate';
+
+    console.warn(`Failed to insert lead ${place.name}:`, insertError.message);
+    return 'error';
+  } catch (err) {
+    console.error(`Error processing ${place.name}:`, err);
+    return 'error';
   }
 }

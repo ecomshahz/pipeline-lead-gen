@@ -16,12 +16,15 @@ export function calculateLeadScore(lead: Partial<Lead>): {
     has_email: 0,
     niche_tier: 0,
     needs_ai: 0,
+    hot_lead_bonus: 0,
     total: 0,
   };
 
-  // No website: +35 points
-  if (!lead.has_website || !lead.website_url) {
-    breakdown.no_website = 35;
+  const hasWebsite = !!(lead.has_website && lead.website_url);
+
+  // No website: +45 points (biggest signal — these are the easiest closes)
+  if (!hasWebsite) {
+    breakdown.no_website = 45;
   } else if (lead.website_score !== null && lead.website_score !== undefined) {
     // Has website but low PageSpeed score
     if (lead.website_score < 50) {
@@ -73,6 +76,18 @@ export function calculateLeadScore(lead: Partial<Lead>): {
   // Needs AI services: +10 points
   if (lead.needs_ai_services) {
     breakdown.needs_ai = 10;
+  }
+
+  // HOT LEAD BONUS: established business with no website + reachable.
+  // These are our highest-conviction closes — a real revenue-generating shop
+  // that literally has no online presence. Easy "yes" to a $X site offer.
+  const reviews = lead.review_count ?? 0;
+  const rating = lead.google_rating ?? 0;
+  if (!hasWebsite && lead.phone && reviews >= 10 && rating >= 4.0) {
+    breakdown.hot_lead_bonus = 15;
+  } else if (!hasWebsite && lead.phone) {
+    // Still no-website + has phone, just less proven — smaller bonus
+    breakdown.hot_lead_bonus = 8;
   }
 
   breakdown.total = Object.entries(breakdown)

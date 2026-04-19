@@ -58,7 +58,10 @@ export async function searchBusinesses(
   const allResults: PlaceResult[] = [];
   let pageToken: string | undefined;
 
-  // Google Places returns up to 20 results per page, max 3 pages (60 results)
+  // Google Places returns up to 20 results per page, max 3 pages (60 results).
+  // Detail fetches run in parallel batches — sequential w/100ms delay was eating ~6s per page.
+  const DETAIL_BATCH_SIZE = 10;
+
   for (let page = 0; page < 3 && allResults.length < maxResults; page++) {
     const results = await withRetry(() =>
       textSearch(query, apiKey, pageToken)
@@ -66,35 +69,40 @@ export async function searchBusinesses(
 
     if (!results || results.results.length === 0) break;
 
-    // Get details for each place (includes phone and website)
-    for (const place of results.results) {
-      if (allResults.length >= maxResults) break;
+    // Cap the page to whatever budget remains
+    const remaining = maxResults - allResults.length;
+    const pagePlaces = results.results.slice(0, remaining);
 
-      try {
-        const details = await withRetry(() =>
-          getPlaceDetails(place.place_id, apiKey)
-        );
+    // Fan out detail requests in parallel batches
+    for (let i = 0; i < pagePlaces.length; i += DETAIL_BATCH_SIZE) {
+      const batch = pagePlaces.slice(i, i + DETAIL_BATCH_SIZE);
+      const settled = await Promise.allSettled(
+        batch.map((place) =>
+          withRetry(() => getPlaceDetails(place.place_id, apiKey))
+        )
+      );
 
-        if (details?.result) {
-          allResults.push(details.result);
+      settled.forEach((res, idx) => {
+        const place = batch[idx];
+        if (res.status === 'fulfilled' && res.value?.result) {
+          allResults.push(res.value.result);
+        } else {
+          if (res.status === 'rejected') {
+            console.warn(`Detail fetch failed for ${place.name}:`, res.reason);
+          }
+          // Fall back to basic info so we don't lose the lead entirely
+          allResults.push({
+            place_id: place.place_id,
+            name: place.name,
+            formatted_address: place.formatted_address,
+            rating: place.rating,
+            user_ratings_total: place.user_ratings_total,
+            business_status: place.business_status,
+            types: place.types,
+            geometry: place.geometry,
+          });
         }
-
-        // Rate limit: 100ms between detail requests
-        await delay(100);
-      } catch (error) {
-        console.error(`Failed to get details for ${place.name}:`, error);
-        // Still include basic info even if details fail
-        allResults.push({
-          place_id: place.place_id,
-          name: place.name,
-          formatted_address: place.formatted_address,
-          rating: place.rating,
-          user_ratings_total: place.user_ratings_total,
-          business_status: place.business_status,
-          types: place.types,
-          geometry: place.geometry,
-        });
-      }
+      });
     }
 
     pageToken = results.next_page_token;

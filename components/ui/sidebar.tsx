@@ -14,6 +14,7 @@ import {
   Menu,
   X,
   Phone,
+  Briefcase,
 } from 'lucide-react';
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -21,6 +22,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 const navItems = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/leads', label: 'Leads', icon: Users },
+  { href: '/clients', label: 'Clients', icon: Briefcase },
   { href: '/scripts', label: 'Call Scripts', icon: Phone },
   { href: '/emails', label: 'Emails', icon: Mail },
   { href: '/scraper', label: 'Scraper', icon: Globe },

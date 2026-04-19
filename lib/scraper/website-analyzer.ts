@@ -11,6 +11,112 @@ export interface WebsiteAnalysis {
   is_mobile_friendly: boolean;
   issues: string[];
   ai_opportunities: string[];
+  /** First plausible business email found on the page, if any */
+  email: string | null;
+}
+
+// Emails we explicitly don't want to treat as real business contact addresses.
+// Noreply / tracking / CDN / template boilerplate / generic vendor addresses.
+const EMAIL_DOMAIN_DENYLIST = [
+  'sentry.io',
+  'sentry-next.wixpress.com',
+  'wixpress.com',
+  'wix.com',
+  'squarespace.com',
+  'godaddy.com',
+  'godaddysites.com',
+  'weebly.com',
+  'example.com',
+  'domain.com',
+  'sentry.wixpress.com',
+];
+
+const EMAIL_LOCAL_DENYLIST = [
+  'noreply',
+  'no-reply',
+  'donotreply',
+  'do-not-reply',
+  'mailer-daemon',
+  'postmaster',
+  'abuse',
+  'webmaster',
+  'privacy',
+  'unsubscribe',
+];
+
+// Rough email regex — good enough for HTML scraping. Not RFC-5321 perfect.
+const EMAIL_PATTERN = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+
+function isPlausibleBusinessEmail(email: string): boolean {
+  const lower = email.toLowerCase();
+  const [local, domain] = lower.split('@');
+  if (!local || !domain) return false;
+  if (EMAIL_LOCAL_DENYLIST.some((bad) => local.startsWith(bad))) return false;
+  if (EMAIL_DOMAIN_DENYLIST.some((bad) => domain.endsWith(bad))) return false;
+  // Filter out sentry/tracking emails that look like hashes
+  if (/^[a-f0-9]{16,}$/.test(local)) return false;
+  return true;
+}
+
+// Score emails so the best candidate wins when a page has several.
+// Owner/contact/booking style addresses score higher than generic info@.
+function scoreEmail(email: string, siteDomain: string | null): number {
+  const lower = email.toLowerCase();
+  const [local, domain] = lower.split('@');
+  let score = 0;
+
+  // Strongly prefer emails on the site's own domain
+  if (siteDomain && domain.endsWith(siteDomain)) score += 50;
+
+  // Role-based priorities
+  const priorities: Array<{ match: RegExp; points: number }> = [
+    { match: /^(owner|founder|ceo|president)/, points: 40 },
+    { match: /^(hello|hi|contact|team)/, points: 30 },
+    { match: /^(booking|bookings|appointments|schedule)/, points: 25 },
+    { match: /^(sales|inquiries|office)/, points: 20 },
+    { match: /^(info|admin)/, points: 15 },
+    { match: /^(support|help)/, points: 10 },
+  ];
+  for (const p of priorities) {
+    if (p.match.test(local)) {
+      score += p.points;
+      break;
+    }
+  }
+
+  // Slight penalty for free providers (still valid, just less professional)
+  if (/@(gmail|yahoo|outlook|hotmail|aol|icloud)\./.test(lower)) score -= 5;
+
+  return score;
+}
+
+/** Extract the best candidate business email from page HTML. */
+function extractEmailFromHtml(
+  $: cheerio.CheerioAPI,
+  html: string,
+  siteDomain: string | null
+): string | null {
+  const candidates = new Set<string>();
+
+  // 1) mailto: links — most reliable signal
+  $('a[href^="mailto:"]').each((_, el) => {
+    const href = $(el).attr('href') ?? '';
+    const raw = href.replace(/^mailto:/i, '').split('?')[0].trim();
+    if (raw) candidates.add(raw);
+  });
+
+  // 2) Free-text scan of the raw HTML (catches emails inside footers, schema.org JSON-LD, etc)
+  const matches = html.match(EMAIL_PATTERN) ?? [];
+  for (const m of matches) candidates.add(m);
+
+  const valid = Array.from(candidates)
+    .map((e) => e.trim())
+    .filter((e) => isPlausibleBusinessEmail(e));
+
+  if (valid.length === 0) return null;
+
+  valid.sort((a, b) => scoreEmail(b, siteDomain) - scoreEmail(a, siteDomain));
+  return valid[0];
 }
 
 // Analyze a website's HTML for quality signals and AI opportunity detection
@@ -50,8 +156,17 @@ export async function analyzeWebsite(url: string): Promise<WebsiteAnalysis> {
       ai_opportunities: [
         'Website appears to be down or unreachable — they may need a new one',
       ],
+      email: null,
     };
   }
+
+  const siteDomain = (() => {
+    try {
+      return new URL(normalizedUrl).hostname.replace(/^www\./, '');
+    } catch {
+      return null;
+    }
+  })();
 
   const $ = cheerio.load(html);
   const htmlLower = html.toLowerCase();
@@ -146,6 +261,8 @@ export async function analyzeWebsite(url: string): Promise<WebsiteAnalysis> {
     issues.push('no_ssl');
   }
 
+  const email = extractEmailFromHtml($, html, siteDomain);
+
   return {
     has_contact_form,
     has_chatbot,
@@ -156,5 +273,6 @@ export async function analyzeWebsite(url: string): Promise<WebsiteAnalysis> {
     is_mobile_friendly,
     issues,
     ai_opportunities,
+    email,
   };
 }

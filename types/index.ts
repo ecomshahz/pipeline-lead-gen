@@ -45,6 +45,7 @@ export interface LeadScoreBreakdown {
   has_email: number;
   niche_tier: number;
   needs_ai: number;
+  hot_lead_bonus: number;
   total: number;
 }
 
@@ -90,6 +91,71 @@ export interface EmailLog {
   sent_at: string;
   opened: boolean;
   replied: boolean;
+}
+
+// ============================================================================
+// CLIENTS — closed business we're actively servicing
+// ============================================================================
+
+export type BillingType = 'one_time' | 'monthly' | 'retainer' | 'project';
+
+export type ClientStatus = 'active' | 'paused' | 'churned' | 'completed';
+
+export interface Client {
+  id: string;
+  lead_id: string | null;
+  business_name: string;
+  owner_name: string | null;
+  email: string | null;
+  phone: string | null;
+  website_url: string | null;
+  city: string | null;
+  state: string | null;
+  niche: string | null;
+  service_type: string;
+  service_description: string | null;
+  billing_type: BillingType;
+  /** Stored in cents. Divide by 100 for display. */
+  amount_cents: number;
+  currency: string;
+  status: ClientStatus;
+  start_date: string;
+  end_date: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ClientPayment {
+  id: string;
+  client_id: string;
+  amount_cents: number;
+  currency: string;
+  paid_at: string;
+  description: string | null;
+  method: string | null;
+  created_at: string;
+}
+
+export interface RevenueMetrics {
+  /** Projected Monthly Recurring Revenue (active monthly/retainer clients) */
+  mrr_cents: number;
+  /** Total revenue ever received (sum of client_payments) */
+  total_revenue_cents: number;
+  /** Revenue received this month */
+  this_month_cents: number;
+  /** Revenue received last month */
+  last_month_cents: number;
+  /** Sum of one-time/project amounts on active clients (contracted but not necessarily paid yet) */
+  contracted_one_time_cents: number;
+  active_clients: number;
+  paused_clients: number;
+  churned_clients: number;
+  completed_clients: number;
+  /** Average deal size (all-time, across paid amounts) */
+  avg_deal_cents: number;
+  /** Last 12 months of revenue for charting: [{ month: '2026-01', revenue_cents: 12000 }, ...] */
+  monthly_revenue: Array<{ month: string; revenue_cents: number }>;
 }
 
 export interface DailyStats {
