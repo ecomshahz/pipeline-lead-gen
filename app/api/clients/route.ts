@@ -131,6 +131,22 @@ export async function POST(request: NextRequest) {
         .neq('status', 'closed_won');
     }
 
+    // When the client already paid (e.g. one-time fee collected at close),
+    // log an initial payment so Total Revenue reflects it immediately.
+    if (body.log_initial_payment && amountCents > 0) {
+      await supabase.from('client_payments').insert({
+        client_id: data.id,
+        amount_cents: amountCents,
+        currency: insert.currency,
+        paid_at: insert.start_date,
+        description:
+          insert.billing_type === 'monthly' || insert.billing_type === 'retainer'
+            ? 'First month'
+            : 'Initial payment',
+        method: body.initial_payment_method ?? null,
+      });
+    }
+
     return NextResponse.json({ client: data }, { status: 201 });
   } catch {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });

@@ -223,6 +223,7 @@ export default function ClientsPage() {
             sub={
               metrics
                 ? [
+                    metrics.completed_clients > 0 && `${metrics.completed_clients} completed`,
                     metrics.paused_clients > 0 && `${metrics.paused_clients} paused`,
                     metrics.churned_clients > 0 && `${metrics.churned_clients} churned`,
                   ]
@@ -549,15 +550,33 @@ function ClientFormModal({
     notes: client?.notes ?? '',
   });
 
+  // "Already paid?" toggle. Default ON for one-time/project (they're usually
+  // collected upfront), OFF for monthly (recognized month-by-month).
+  // Only meaningful on CREATE — existing clients log payments via the detail view.
+  const [logInitialPayment, setLogInitialPayment] = useState(
+    !isEdit && (form.billing_type === 'one_time' || form.billing_type === 'project')
+  );
+  const [initialPaymentMethod, setInitialPaymentMethod] = useState('');
+
   const update = <K extends keyof typeof form>(key: K, value: (typeof form)[K]) => {
     setForm((f) => ({ ...f, [key]: value }));
+    // Smart default for the "already paid" checkbox based on billing type
+    if (key === 'billing_type' && !isEdit) {
+      const bt = value as BillingType;
+      setLogInitialPayment(bt === 'one_time' || bt === 'project');
+    }
   };
 
   const save = async () => {
     setSaving(true);
     setError(null);
     try {
-      const payload = { ...form };
+      const payload: Record<string, unknown> = { ...form };
+      // Only meaningful on create — don't confuse PATCH with it
+      if (!isEdit && logInitialPayment) {
+        payload.log_initial_payment = true;
+        if (initialPaymentMethod) payload.initial_payment_method = initialPaymentMethod;
+      }
       const res = await fetch('/api/clients', {
         method: isEdit ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -727,18 +746,51 @@ function ClientFormModal({
                 required
               >
                 <div className="relative">
-                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71717A]">$</span>
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none">$</span>
                   <input
                     type="number"
                     min="0"
                     step="0.01"
                     value={form.amount}
                     onChange={(e) => update('amount', parseFloat(e.target.value) || 0)}
-                    className="input pl-7"
+                    className="input pl-8"
                   />
                 </div>
               </Field>
             </div>
+
+            {/* Auto-log initial payment (create flow only) */}
+            {!isEdit && form.amount > 0 && (
+              <div className="rounded-lg border border-[#1E1E2A] bg-[#0A0A0F] p-3">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={logInitialPayment}
+                    onChange={(e) => setLogInitialPayment(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded border-[#1E1E2A] bg-[#0A0A0F] text-[#3B82F6] focus:ring-[#3B82F6]/30 cursor-pointer"
+                  />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm text-white font-medium">
+                      {form.billing_type === 'monthly' || form.billing_type === 'retainer'
+                        ? 'Log the first month as received ($' + form.amount.toFixed(2) + ')'
+                        : 'Payment already received ($' + form.amount.toFixed(2) + ')'}
+                    </div>
+                    <div className="text-xs text-[#71717A] mt-0.5">
+                      Creates a payment record so Total Revenue reflects this amount immediately.
+                    </div>
+                    {logInitialPayment && (
+                      <input
+                        type="text"
+                        value={initialPaymentMethod}
+                        onChange={(e) => setInitialPaymentMethod(e.target.value)}
+                        placeholder="Payment method (optional — stripe, wire, check, etc.)"
+                        className="mt-2 w-full px-2 py-1.5 bg-[#111118] border border-[#1E1E2A] rounded-md text-xs text-white outline-none focus:border-[#3B82F6]"
+                      />
+                    )}
+                  </div>
+                </label>
+              </div>
+            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <Field label="Status">
@@ -1082,7 +1134,7 @@ function ClientDetailModal({
                   </div>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                     <div className="relative col-span-2 sm:col-span-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71717A]">$</span>
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none">$</span>
                       <input
                         type="number"
                         min="0"
@@ -1090,7 +1142,7 @@ function ClientDetailModal({
                         value={paymentAmount || ''}
                         onChange={(e) => setPaymentAmount(parseFloat(e.target.value) || 0)}
                         placeholder="0.00"
-                        className="w-full pl-7 pr-2 py-2 bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg text-sm text-white outline-none focus:border-[#3B82F6]"
+                        className="w-full pl-8 pr-2 py-2 bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg text-sm text-white outline-none focus:border-[#3B82F6]"
                       />
                     </div>
                     <input
