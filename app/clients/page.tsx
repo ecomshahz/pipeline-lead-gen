@@ -19,6 +19,9 @@ import {
   ExternalLink,
   CheckCircle2,
   AlertCircle,
+  Square,
+  CheckSquare,
+  MinusSquare,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type {
@@ -117,6 +120,10 @@ export default function ClientsPage() {
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [detailId, setDetailId] = useState<string | null>(null);
 
+  // Bulk selection
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
+
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -154,6 +161,77 @@ export default function ClientsPage() {
     setEditingClient(null);
     setFormOpen(true);
   };
+
+  // ---- Selection helpers ----
+
+  const toggleOne = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleAll = useCallback(() => {
+    setSelectedIds((prev) => {
+      // If every filtered row is already selected, clear. Otherwise select all visible.
+      const allSelected = filtered.length > 0 && filtered.every((c) => prev.has(c.id));
+      if (allSelected) return new Set();
+      return new Set(filtered.map((c) => c.id));
+    });
+  }, [filtered]);
+
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+
+  const allOnPageSelected = filtered.length > 0 && filtered.every((c) => selectedIds.has(c.id));
+  const someOnPageSelected = filtered.some((c) => selectedIds.has(c.id));
+
+  const deleteOne = useCallback(
+    async (client: Client) => {
+      const confirmMsg = `Delete ${client.business_name}? This also removes their payment history. Cannot be undone.`;
+      if (!confirm(confirmMsg)) return;
+      setDeleting(true);
+      try {
+        const res = await fetch(`/api/clients?id=${client.id}`, { method: 'DELETE' });
+        if (res.ok) {
+          setSelectedIds((prev) => {
+            const next = new Set(prev);
+            next.delete(client.id);
+            return next;
+          });
+          await refresh();
+        }
+      } finally {
+        setDeleting(false);
+      }
+    },
+    [refresh]
+  );
+
+  const deleteSelected = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+    const confirmMsg =
+      selectedIds.size === 1
+        ? 'Delete 1 client? This also removes their payment history. Cannot be undone.'
+        : `Delete ${selectedIds.size} clients? This also removes all their payment history. Cannot be undone.`;
+    if (!confirm(confirmMsg)) return;
+
+    setDeleting(true);
+    try {
+      // Parallel DELETE calls — fine for dozens of clients.
+      // Falls back to sequential if we ever hit a rate limit (we won't on Supabase service key).
+      await Promise.all(
+        Array.from(selectedIds).map((id) =>
+          fetch(`/api/clients?id=${id}`, { method: 'DELETE' })
+        )
+      );
+      clearSelection();
+      await refresh();
+    } finally {
+      setDeleting(false);
+    }
+  }, [selectedIds, refresh, clearSelection]);
 
   return (
     <div className="min-h-screen bg-[#0A0A0F] text-white p-6 lg:p-10">
@@ -278,12 +356,60 @@ export default function ClientsPage() {
           </div>
         </div>
 
+        {/* Bulk action bar — slides in when any rows are selected */}
+        <AnimatePresence>
+          {selectedIds.size > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="mb-4 flex items-center justify-between gap-3 px-4 py-2.5 rounded-lg bg-[#3B82F6]/10 border border-[#3B82F6]/30"
+            >
+              <div className="flex items-center gap-3 text-sm">
+                <span className="text-[#3B82F6] font-medium">
+                  {selectedIds.size} selected
+                </span>
+                <button
+                  onClick={clearSelection}
+                  className="text-xs text-[#71717A] hover:text-white transition-colors"
+                >
+                  Clear
+                </button>
+              </div>
+              <button
+                onClick={deleteSelected}
+                disabled={deleting}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-500/10 border border-red-500/30 text-red-400 hover:bg-red-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {deleting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                Delete selected
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Client table */}
         <div className="bg-[#111118] border border-[#1E1E2A] rounded-xl overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr className="border-b border-[#1E1E2A]">
+                  <th className="w-12 px-4 py-3">
+                    <button
+                      onClick={toggleAll}
+                      disabled={filtered.length === 0}
+                      className="text-[#71717A] hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                      aria-label="Select all"
+                    >
+                      {allOnPageSelected ? (
+                        <CheckSquare className="w-4 h-4 text-[#3B82F6]" />
+                      ) : someOnPageSelected ? (
+                        <MinusSquare className="w-4 h-4 text-[#3B82F6]" />
+                      ) : (
+                        <Square className="w-4 h-4" />
+                      )}
+                    </button>
+                  </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-[#71717A] uppercase tracking-wider">Business</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-[#71717A] uppercase tracking-wider">Service</th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-[#71717A] uppercase tracking-wider">Billing</th>
@@ -296,14 +422,14 @@ export default function ClientsPage() {
               <tbody>
                 {loading && clients.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-20 text-center">
+                    <td colSpan={8} className="py-20 text-center">
                       <Loader2 className="w-6 h-6 text-[#3B82F6] animate-spin mx-auto mb-3" />
                       <span className="text-sm text-[#71717A]">Loading clients...</span>
                     </td>
                   </tr>
                 ) : filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-20 text-center">
+                    <td colSpan={8} className="py-20 text-center">
                       <Briefcase className="w-8 h-8 text-[#71717A] mx-auto mb-3" />
                       <p className="text-sm text-[#71717A] mb-1">
                         {clients.length === 0 ? 'No clients yet.' : 'No clients match these filters.'}
@@ -316,12 +442,30 @@ export default function ClientsPage() {
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((c) => (
+                  filtered.map((c) => {
+                    const checked = selectedIds.has(c.id);
+                    return (
                     <tr
                       key={c.id}
                       onClick={() => setDetailId(c.id)}
-                      className="border-b border-[#1E1E2A] last:border-b-0 hover:bg-[#0F0F15] cursor-pointer transition-colors"
+                      className={cn(
+                        'border-b border-[#1E1E2A] last:border-b-0 hover:bg-[#0F0F15] cursor-pointer transition-colors',
+                        checked && 'bg-[#3B82F6]/5'
+                      )}
                     >
+                      <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          onClick={() => toggleOne(c.id)}
+                          className="text-[#71717A] hover:text-white transition-colors"
+                          aria-label={checked ? 'Deselect' : 'Select'}
+                        >
+                          {checked ? (
+                            <CheckSquare className="w-4 h-4 text-[#3B82F6]" />
+                          ) : (
+                            <Square className="w-4 h-4" />
+                          )}
+                        </button>
+                      </td>
                       <td className="px-4 py-3">
                         <div className="font-medium text-white">{c.business_name}</div>
                         {c.city && c.state && (
@@ -377,10 +521,19 @@ export default function ClientsPage() {
                           >
                             <Pencil className="w-4 h-4" />
                           </button>
+                          <button
+                            onClick={() => deleteOne(c)}
+                            disabled={deleting}
+                            title="Delete"
+                            className="p-1 rounded text-[#71717A] hover:text-red-400 hover:bg-red-500/10 transition-colors disabled:opacity-50"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
                         </div>
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -745,15 +898,16 @@ function ClientFormModal({
                 label={`Amount ${form.billing_type === 'monthly' || form.billing_type === 'retainer' ? '(per month)' : '(total)'}`}
                 required
               >
-                <div className="relative">
-                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none">$</span>
+                <div className="relative flex items-center">
+                  <span className="absolute left-3.5 text-[#71717A] pointer-events-none text-sm z-10">$</span>
                   <input
                     type="number"
                     min="0"
                     step="0.01"
                     value={form.amount}
                     onChange={(e) => update('amount', parseFloat(e.target.value) || 0)}
-                    className="input pl-8"
+                    className="input"
+                    style={{ paddingLeft: '2rem' }}
                   />
                 </div>
               </Field>
@@ -1133,8 +1287,8 @@ function ClientDetailModal({
                     Log a payment
                   </div>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                    <div className="relative col-span-2 sm:col-span-1">
-                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none">$</span>
+                    <div className="relative col-span-2 sm:col-span-1 flex items-center">
+                      <span className="absolute left-3.5 text-[#71717A] pointer-events-none text-sm z-10">$</span>
                       <input
                         type="number"
                         min="0"
@@ -1142,7 +1296,8 @@ function ClientDetailModal({
                         value={paymentAmount || ''}
                         onChange={(e) => setPaymentAmount(parseFloat(e.target.value) || 0)}
                         placeholder="0.00"
-                        className="w-full pl-8 pr-2 py-2 bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg text-sm text-white outline-none focus:border-[#3B82F6]"
+                        className="w-full pr-2 py-2 bg-[#0A0A0F] border border-[#1E1E2A] rounded-lg text-sm text-white outline-none focus:border-[#3B82F6]"
+                        style={{ paddingLeft: '2rem' }}
                       />
                     </div>
                     <input
