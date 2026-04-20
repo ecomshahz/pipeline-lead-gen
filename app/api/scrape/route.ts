@@ -223,7 +223,8 @@ async function runScrapeJob(
   hunterApiKey: string,
   supabase: ReturnType<typeof getServiceSupabase>
 ) {
-  let leadsFound = 0;
+  // Shared counter used to enforce a hard cap across parallel inserts.
+  const counter: LeadCounter = { inserted: 0, reserved: 0, target: HOT_LEAD_TARGET };
   const startedAt = Date.now();
   const deadlineMs = startedAt + (maxDuration * 1000) - TIMEOUT_BUFFER_MS;
   // PageSpeed is slow (3-30s per URL) and optional — enable with RUN_PAGESPEED=true
@@ -252,9 +253,8 @@ async function runScrapeJob(
 
     // Process places in parallel batches. Each batch does Google + website +
     // optional Hunter + DB insert concurrently — bounded so we don't melt anything.
-    // We stop as soon as we've inserted HOT_LEAD_TARGET qualified leads, even
-    // if there are more candidates left in the pool.
-    for (let i = 0; i < sortedPlaces.length && leadsFound < HOT_LEAD_TARGET; i += PLACE_BATCH_SIZE) {
+    // Hard cap is enforced inside processPlace via the shared counter.
+    for (let i = 0; i < sortedPlaces.length && counter.inserted < HOT_LEAD_TARGET; i += PLACE_BATCH_SIZE) {
       // Check if job was cancelled
       if (cancelledJobs.has(jobId)) {
         console.log(`Job ${jobId} cancelled by user`);
@@ -264,12 +264,14 @@ async function runScrapeJob(
 
       // Bail if we're about to hit Vercel's serverless timeout.
       if (Date.now() > deadlineMs) {
-        console.log(`Job ${jobId} stopping early near timeout (${leadsFound} hot leads found)`);
+        console.log(`Job ${jobId} stopping early near timeout (${counter.inserted} hot leads found)`);
         break;
       }
 
       const batch = sortedPlaces.slice(i, i + PLACE_BATCH_SIZE);
-      const batchInserts = await Promise.allSettled(
+      const before = counter.inserted;
+
+      await Promise.allSettled(
         batch.map((place) =>
           processPlace(
             place,
@@ -279,27 +281,21 @@ async function runScrapeJob(
             pagespeedApiKey,
             hunterApiKey,
             runPageSpeed,
-            supabase
+            supabase,
+            counter
           )
         )
       );
 
-      let batchFound = 0;
-      for (const result of batchInserts) {
-        if (result.status === 'fulfilled' && result.value === 'inserted') {
-          batchFound++;
-        }
-      }
-
-      if (batchFound > 0) {
-        leadsFound += batchFound;
+      if (counter.inserted > before) {
         await supabase
           .from('scrape_jobs')
-          .update({ leads_found: leadsFound })
+          .update({ leads_found: counter.inserted })
           .eq('id', jobId);
       }
     }
 
+    const leadsFound = counter.inserted;
     console.log(
       `Job ${jobId} done: inserted ${leadsFound} hot leads from ${sortedPlaces.length} candidates`
     );
@@ -340,7 +336,7 @@ async function runScrapeJob(
       .from('scrape_jobs')
       .update({
         status: 'failed',
-        leads_found: leadsFound,
+        leads_found: counter.inserted,
         completed_at: new Date().toISOString(),
         error_message: errorMessage,
       })
@@ -353,6 +349,11 @@ async function runScrapeJob(
 // Per-place pipeline: website analysis → AI detection → email lookup → DB insert.
 // Returns 'inserted' on success, 'duplicate' on dedup, 'error' on failure.
 // Designed to be safely run in parallel (Promise.allSettled) for many places at once.
+// Shared, mutable counter passed through the parallel batch so we can enforce
+// a HARD cap on inserted leads even across concurrent tasks. `reserved`
+// tracks inserts in flight so racing tasks can't collectively overshoot.
+type LeadCounter = { inserted: number; reserved: number; target: number };
+
 async function processPlace(
   place: PlaceResult,
   niche: string,
@@ -361,8 +362,9 @@ async function processPlace(
   pagespeedApiKey: string,
   hunterApiKey: string,
   runPageSpeed: boolean,
-  supabase: ReturnType<typeof getServiceSupabase>
-): Promise<'inserted' | 'duplicate' | 'skipped_has_good_website' | 'error'> {
+  supabase: ReturnType<typeof getServiceSupabase>,
+  counter: LeadCounter
+): Promise<'inserted' | 'duplicate' | 'skipped_has_good_website' | 'skipped_target_reached' | 'error'> {
   try {
     const parsed = parseAddress(place.formatted_address);
     const hasWebsite = !!place.website;
@@ -443,13 +445,29 @@ async function processPlace(
 
     const { score, breakdown } = calculateLeadScore(leadData);
 
-    const { error: insertError } = await supabase.from('leads').insert({
-      ...leadData,
-      lead_score: score,
-      lead_score_breakdown: breakdown,
-    });
+    // HARD CAP: reserve a slot before the insert. If we + other in-flight
+    // tasks have already claimed the target, bail without writing.
+    if (counter.inserted + counter.reserved >= counter.target) {
+      return 'skipped_target_reached';
+    }
+    counter.reserved++;
 
-    if (!insertError) return 'inserted';
+    let insertError;
+    try {
+      const result = await supabase.from('leads').insert({
+        ...leadData,
+        lead_score: score,
+        lead_score_breakdown: breakdown,
+      });
+      insertError = result.error;
+    } finally {
+      counter.reserved--;
+    }
+
+    if (!insertError) {
+      counter.inserted++;
+      return 'inserted';
+    }
     if (insertError.message.includes('duplicate')) return 'duplicate';
 
     console.warn(`Failed to insert lead ${place.name}:`, insertError.message);
