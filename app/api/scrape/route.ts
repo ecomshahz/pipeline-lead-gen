@@ -16,13 +16,58 @@ import { STATE_TIMEZONES } from '@/lib/niches';
 // The scrape loop checks this and bails before the function is killed.
 export const maxDuration = 60;
 
-// Process at most this many places per job. 60 is Google Places' hard ceiling
-// (3 pages × 20). Heavy lifting is parallelized, so this fits inside maxDuration.
-const MAX_PLACES_PER_JOB = 60;
+// We cap every scrape at this many QUALIFIED hot/warm leads. Low-quality
+// businesses (solid existing websites) get filtered out — the user wants a
+// clean pipeline of prospects worth calling, not a huge dump of noise.
+const HOT_LEAD_TARGET = 20;
+
+// We pull up to this many candidates from Google so we have a large enough
+// pool to find 20 genuinely qualified leads even if most have decent sites.
+const CANDIDATE_POOL_SIZE = 60;
 
 // How many places we analyze concurrently. Each branch does a website fetch
 // (≤5s) plus a few DB ops. 10 keeps Vercel + Supabase happy.
 const PLACE_BATCH_SIZE = 10;
+
+/**
+ * Decides whether a business is "hot" enough to be worth a sales call.
+ * The whole point of the pipeline is to surface businesses we can realistically
+ * close. If they already have a fast, modern, mobile-friendly website with
+ * online booking and a contact form, we probably can't sell them a new one.
+ *
+ * A business qualifies if ANY of these are true:
+ *   - No website at all (strongest signal — guaranteed close opportunity)
+ *   - Website we couldn't even fetch (likely broken, slow, or dead)
+ *   - Missing mobile viewport meta (ancient/amateur site in 2026)
+ *   - No SSL cert (security red flag, easy upsell)
+ *   - PageSpeed score <70 when available (measurable performance pitch)
+ *   - Missing BOTH contact form AND booking system (we have a clear pitch)
+ */
+function qualifiesAsHotLead(
+  hasWebsite: boolean,
+  websiteAnalysis: { issues: string[] } | null,
+  websiteScore: number | null
+): boolean {
+  if (!hasWebsite) return true;
+  if (!websiteAnalysis) return true; // analysis failed → probably a broken site
+
+  const issues = new Set(websiteAnalysis.issues ?? []);
+
+  // Critical single-signal disqualifications of the current site
+  if (issues.has('website_unreachable')) return true;
+  if (issues.has('not_mobile_friendly')) return true;
+  if (issues.has('no_ssl')) return true;
+
+  // Measurable slowness (only when PageSpeed ran)
+  if (websiteScore !== null && websiteScore < 70) return true;
+
+  // Double-missing: no contact form AND no online booking. For service
+  // businesses this is a clear pitch ("you're leaking leads after hours").
+  if (issues.has('no_contact_form') && issues.has('no_booking_system')) return true;
+
+  // Otherwise they've got a reasonable web presence — skip.
+  return false;
+}
 
 // How many seconds before function timeout we should stop starting new work.
 // Leaves a buffer so in-flight work (DB writes) can complete.
@@ -185,9 +230,12 @@ async function runScrapeJob(
   const runPageSpeed = process.env.RUN_PAGESPEED === 'true';
 
   try {
-    // Step 1: Search Google Places (capped so we fit within maxDuration)
-    const places = await searchBusinesses(niche, city, state, googleApiKey, MAX_PLACES_PER_JOB);
-    console.log(`Found ${places.length} places for ${niche} in ${city}, ${state}`);
+    // Step 1: Pull a large candidate pool from Google. We'll filter down to
+    // HOT_LEAD_TARGET qualified businesses from this pool.
+    const places = await searchBusinesses(niche, city, state, googleApiKey, CANDIDATE_POOL_SIZE);
+    console.log(
+      `Found ${places.length} candidates for ${niche} in ${city}, ${state} — filtering to ${HOT_LEAD_TARGET} hot leads`
+    );
 
     // Hot-lead prioritization: process businesses with NO website first.
     // They're the highest-value prospects for an AI/web agency, AND they skip
@@ -204,7 +252,9 @@ async function runScrapeJob(
 
     // Process places in parallel batches. Each batch does Google + website +
     // optional Hunter + DB insert concurrently — bounded so we don't melt anything.
-    for (let i = 0; i < sortedPlaces.length; i += PLACE_BATCH_SIZE) {
+    // We stop as soon as we've inserted HOT_LEAD_TARGET qualified leads, even
+    // if there are more candidates left in the pool.
+    for (let i = 0; i < sortedPlaces.length && leadsFound < HOT_LEAD_TARGET; i += PLACE_BATCH_SIZE) {
       // Check if job was cancelled
       if (cancelledJobs.has(jobId)) {
         console.log(`Job ${jobId} cancelled by user`);
@@ -214,7 +264,7 @@ async function runScrapeJob(
 
       // Bail if we're about to hit Vercel's serverless timeout.
       if (Date.now() > deadlineMs) {
-        console.log(`Job ${jobId} stopping early near timeout (${leadsFound} leads found)`);
+        console.log(`Job ${jobId} stopping early near timeout (${leadsFound} hot leads found)`);
         break;
       }
 
@@ -249,6 +299,10 @@ async function runScrapeJob(
           .eq('id', jobId);
       }
     }
+
+    console.log(
+      `Job ${jobId} done: inserted ${leadsFound} hot leads from ${sortedPlaces.length} candidates`
+    );
 
     // Update job as completed
     await supabase
@@ -308,7 +362,7 @@ async function processPlace(
   hunterApiKey: string,
   runPageSpeed: boolean,
   supabase: ReturnType<typeof getServiceSupabase>
-): Promise<'inserted' | 'duplicate' | 'error'> {
+): Promise<'inserted' | 'duplicate' | 'skipped_has_good_website' | 'error'> {
   try {
     const parsed = parseAddress(place.formatted_address);
     const hasWebsite = !!place.website;
@@ -339,6 +393,12 @@ async function processPlace(
       } else {
         console.warn(`Website analysis failed for ${place.website}:`, htmlResult.reason);
       }
+    }
+
+    // HOT-LEAD GATE: bail early on businesses with a solid existing web
+    // presence. They're not a fit for "we'll build you a website" pitches.
+    if (!qualifiesAsHotLead(hasWebsite, websiteAnalysis, websiteScore)) {
+      return 'skipped_has_good_website';
     }
 
     const aiResult = detectAIOpportunities(websiteAnalysis, hasWebsite);
